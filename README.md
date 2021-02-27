@@ -6,5 +6,5 @@
 
 # 目录  
 
-1. [kube-scheduler](./kube-scheduler.md)
-2. [client-go](./client-go.md)
+1. [kube-scheduler](./kube-scheduler/README.md)
+2. [client-go](./client-go/README.md)
