@@ -8,4 +8,4 @@
 
 1. [SchedulingQueue](./SchedulingQueue.md)
 2. [Cache](./Cache.md)
-3. PodNominator
+3. [PodNominator](./PodNominator.md)
