@@ -6,7 +6,7 @@
 
 # sharedIndexInformer流程
 
-![流程图](SharedIndexInformerFlow.png)
+![流程图](./SharedIndexInformerFlow.png)
 
 流程图注释如下:
 
