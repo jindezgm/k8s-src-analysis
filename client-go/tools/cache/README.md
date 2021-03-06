@@ -7,4 +7,5 @@
 # 目录
 
 1. [ListerWatcher](./ListerWatcher.md)
-2. [SharedIndexInformer](./SharedIndexInformer.md)
+2. [Controller](./Controller.md)
+3. [SharedIndexInformer](./SharedIndexInformer.md)
