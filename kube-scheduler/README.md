@@ -6,6 +6,7 @@
 
 # 目录
 
-1. [SchedulingQueue](./SchedulingQueue.md)
-2. [Cache](./Cache.md)
+1. [调度队列SchedulingQueue](./SchedulingQueue.md)
+2. [调度缓存Cache](./Cache.md)
 3. [PodNominator](./PodNominator.md)
+4. [调度插件Plugin](./Plugin.md)

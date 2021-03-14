@@ -1,7 +1,7 @@
 <!--
  * @Author: jinde.zgm
  * @Date: 2021-03-09 21:47:58
- * @Description: 
+ * @Description: 调度插件代码解析
 -->
 
 # 前言
@@ -837,8 +837,8 @@ func getDefaultConfig() *schedulerapi.Plugins {
 
 # 总结
 
-1. 从调度队列的排序到最终Pod绑定到Node，整个过程分为QueueuSortPlugin、PreFilterPlugin、FilterPlugin、PostFilterPlugin、PreScorePlugin、ScorePlugin、ReservePlugin、PermitPlugin、PreBindPlugin、BindPlugin、PostBindPlugin总共11个接口，官方称这些接口为调度框架的11个扩展点，可以按需扩展调度能力；
-2. 每种类型的插件给多种实现，比如PreFiltePlugin就有InterPodAffinity、PodTopologySpread、SelectorSpread和TaintToleration 4种实现，每种实现都对应一种调度需求；
-3. 一个类型可以实现多种类型插件接口（多继承），比如VolumeBinding就实现了PreFilterPlugin、FilterPlugin、ReservePlugin和PreBindPlugin 4种插件接口，因为PVC与PV绑定需要在调度过程的不同阶段做同步的事情；
+1. 从调度队列的排序到最终Pod绑定到Node，整个过程分为QueueSortPlugin、PreFilterPlugin、FilterPlugin、PostFilterPlugin、PreScorePlugin、ScorePlugin、ReservePlugin、PermitPlugin、PreBindPlugin、BindPlugin、PostBindPlugin总共11个接口，官方称这些接口为调度框架的11个扩展点，可以按需扩展调度能力；
+2. 每种类型的插件可以有多种实现，比如PreFiltePlugin就有InterPodAffinity、PodTopologySpread、SelectorSpread和TaintToleration 4种实现，每种实现都对应一种调度需求；
+3. 一个类型可以实现多种类型插件接口（多继承），比如VolumeBinding就实现了PreFilterPlugin、FilterPlugin、ReservePlugin和PreBindPlugin 4种插件接口，因为PVC与PV绑定需要在调度过程的不同阶段做不同的事情；
 4. 所有插件都需要静态编译注册到注册表中，可以通过Provider、Policy(File、ConfigMap)方式配置插件；
 5. 每个配置都有一个名字，对应一个Scheduling Profile，调度Pod的时候可以指定调度器名字；
