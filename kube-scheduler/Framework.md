@@ -153,3 +153,209 @@ type Framework interface {
 ### frameworkImpl
 
 为什么称之为框架？因为他是固定的，差异在于配置导致插件的组合不同。也就是说，即便有多个SchedulingProfile，但是只有一个Framework实现，无非Framework成员变量引用的插件不同而已。来看看Framework实现代码，源码链接：<https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/scheduler/framework/runtime/framework.go#L66>
+
+```go
+type frameworkImpl struct {
+    // 调度插件注册表(详情参看调度插件文档)，这个非常有用，frameworkImpl的构造函数需要用它来创建配置的插件。
+    registry              Registry
+    // 这个是为实现Handle.SnapshotSharedLister()接口准备的，是创建frameworkImpl时传入的，不是frameworkImpl自己创建的。
+    // 至于framework.SharedLister类型会在调度器的文章中介绍，此处暂时不用关心，因为不影响阅读。
+    snapshotSharedLister  framework.SharedLister
+    // 这是为实现Handle.GetWaitingPod/RejectWaitingPod/IterateOverWaitingPods()接口准备的。
+    // 关于waitingPodsMap请参看https://github.com/jindezgm/k8s-src-analysis/blob/master/kube-scheduler/WaitingPods.md
+    waitingPods           *waitingPodsMap
+    // 插件名字与权重的映射，用来根据插件名字获取权重，为什么要有这个变量呢？因为插件的权重是配置的，对于每个Framework都不同。
+    // 所以pluginNameToWeightMap是在构造函数中根据SchedulingProfile生成的。
+    pluginNameToWeightMap map[string]int
+    // 所有扩展点的插件，为实现Framework.RunXxxPlugins()准备的，不难理解，就是每个扩展点遍历插件执行就可以了。
+    // 下面所有插件都是在构造函数中根据SchedulingProfile生成的。
+    queueSortPlugins      []framework.QueueSortPlugin
+    preFilterPlugins      []framework.PreFilterPlugin
+    filterPlugins         []framework.FilterPlugin
+    postFilterPlugins     []framework.PostFilterPlugin
+    preScorePlugins       []framework.PreScorePlugin
+    scorePlugins          []framework.ScorePlugin
+    reservePlugins        []framework.ReservePlugin
+    preBindPlugins        []framework.PreBindPlugin
+    bindPlugins           []framework.BindPlugin
+    postBindPlugins       []framework.PostBindPlugin
+    permitPlugins         []framework.PermitPlugin
+
+    // 这些是为实现Handle.Clientset/EventHandler/SharedInformerFactory()准备的，因为Framework继承了Handle。
+    // 这些成员变量是同构构造函数的参数出入的，不是frameworkImpl自己创建的。
+    clientSet       clientset.Interface
+    eventRecorder   events.EventRecorder
+    informerFactory informers.SharedInformerFactory
+
+    metricsRecorder *metricsRecorder
+    // 为实现Handle.ProfileName()准备的。
+    profileName     string
+
+    // 为实现Framework.PreemptHandle()准备的
+    preemptHandle framework.PreemptHandle
+
+    // 如果为true，RunFilterPlugins第一次失败后不返回，应该积累有失败的状态。
+    runAllFilters bool
+}
+```
+
+### Framework构造函数
+
+从frameworkImpl的成员变量来看，基本可以想象得到如何实现Framework的接口，所以本文只挑选一些代表性的接口实现，其他的读者自己阅读即可，没什么难度。首先，frameworkImpl的构造函数是一个比较关键的函数，因为一些关键的成员变量是在构造函数中创建的。源码链接：<https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/scheduler/framework/runtime/framework.go#L235>
+
+```go
+// NewFramework()是frameworkImpl的构造函数，前三个参数在调度插件的文档中有介绍，此处简单描述一下：
+// 1. r: 插件注册表，可以根据插件的名字创建插件；
+// 2. plugins: 插件开关配置，就是使能/禁止哪些插件；
+// 3. args: 插件自定义参数，用来创建插件；
+// 4. opts: 构造frameworkImpl的选项参数，frameworkImpl有不少成员变量是通过opts传入进来的；
+func NewFramework(r Registry, plugins *config.Plugins, args []config.PluginConfig, opts ...Option) (framework.Framework, error) {
+    // 应用所有选项，Option这种玩法不稀奇了，golang有太多项目采用类似的方法
+    options := defaultFrameworkOptions
+    for _, opt := range opts {
+        opt(&options)
+    }
+
+    // 可以看出来frameworkImpl很多成员变量来自opts
+    f := &frameworkImpl{
+        registry:              r,
+        snapshotSharedLister:  options.snapshotSharedLister,
+        pluginNameToWeightMap: make(map[string]int),
+        waitingPods:           newWaitingPodsMap(),
+        clientSet:             options.clientSet,
+        eventRecorder:         options.eventRecorder,
+        informerFactory:       options.informerFactory,
+        metricsRecorder:       options.metricsRecorder,
+        profileName:           options.profileName,
+        runAllFilters:         options.runAllFilters,
+    }
+    // preemptHandle实现了PreemptHandle接口，其中Extenders和PodNominator都是通过opts传入的。
+    // 因为frameworkImpl实现了Framework接口，所以也就是实现了PluginsRunner接口。
+    f.preemptHandle = &preemptHandle{
+        extenders:     options.extenders,
+        PodNominator:  options.podNominator,
+        PluginsRunner: f,
+    }
+    if plugins == nil {
+        return f, nil
+    }
+
+    // pluginsNeeded()函数名是获取需要的插件，就是把plugins中所有使能(Enable)的插件转换成map[string]config.Plugin。
+    // pg中是所有使能的插件，key是插件名字，value是config.Plugin(插件权重)，试问为什么要转换成map？
+    // 笔者在调度插件的文章中提到了，很多插件实现了不同扩展点的插件接口，这会造成plugins中有很多相同名字的插件，只是分布在不同的扩展点。
+    // 因为map有去重能力，这样可以避免相同的插件创建多个对象。
+    pg := f.pluginsNeeded(plugins)
+
+    // pluginConfig存储的是所有使能插件的参数
+    pluginConfig := make(map[string]runtime.Object, len(args))
+    for i := range args {
+        // 遍历所有插件参数，并找到使能插件的参数，因为pg是所有使能的插件。
+        name := args[i].Name
+        if _, ok := pluginConfig[name]; ok {
+            return nil, fmt.Errorf("repeated config for plugin %s", name)
+        }
+        pluginConfig[name] = args[i].Args
+    }
+    // outputProfile是需要输出的KubeSchedulerProfile对象。
+    // 前文提到的SchedulingProfile对应的类型就是KubeSchedulerProfile，包括Profile的名字、插件配置以及插件参数。
+    // 因为在构造frameworkImpl的时候会过滤掉不用的插件参数，所以调用者如果需要，可以通过opts传入回调函数捕获KubeSchedulerProfile。
+    outputProfile := config.KubeSchedulerProfile{
+        SchedulerName: f.profileName,
+        Plugins:       plugins,
+        PluginConfig:  make([]config.PluginConfig, 0, len(pg)),
+    }
+
+    // 此处需要区分framework.Plugin和config.Plugin，前者是插件接口基类，后者是插件权重配置，所以接下来就是创建所有使能的插件了。
+    pluginsMap := make(map[string]framework.Plugin)
+    var totalPriority int64
+    // 遍历插件注册表
+    for name, factory := range r {
+        // 如果没有使能，则跳过。这里的遍历有点意思，为什么不遍历pg，然后查找r，这样不是更容易理解么？
+        // 其实遍历pg会遇到一个问题，如果r中没有找到怎么办？也就是配置了一个没有注册的插件，报错么？
+        // 而当前的遍历方法传达的思想是，就这多插件，使能了哪个就创建哪个，不会出错，不需要异常处理。
+        if _, ok := pg[name]; !ok {
+            continue
+        }
+        // getPluginArgsOrDefault()根据插件名字从pluginConfig获取参数，如果没有则返回默认参数，函数名字已经告诉我们一切了。
+        args, err := getPluginArgsOrDefault(pluginConfig, name)
+        if err != nil {
+            return nil, fmt.Errorf("getting args for Plugin %q: %w", name, err)
+        }
+        // 输出插件参数，这也是为什么有捕获KubeSchedulerProfile的功能，因为在没有配置参数的情况下要创建默认参数。
+        // 捕获KubeSchedulerProfile可以避免调用者再实现一次类似的操作，前提是有捕获的需求。
+        if args != nil {
+            outputProfile.PluginConfig = append(outputProfile.PluginConfig, config.PluginConfig{
+                Name: name,
+                Args: args,
+            })
+        }
+        // 利用插件工厂创建插件，传入插件参数和框架句柄
+        p, err := factory(args, f)
+        if err != nil {
+            return nil, fmt.Errorf("initializing plugin %q: %w", name, err)
+        }
+        pluginsMap[name] = p
+
+        // 记录配置的插件权重
+        f.pluginNameToWeightMap[name] = int(pg[name].Weight)
+        // f.pluginNameToWeightMap[name] == 0有两种可能：1）没有配置权重，2）配置权重为0
+        // 无论哪一种，权重为0是不允许的，即便它不是ScorePlugin，如果为0则使用默认值1
+        if f.pluginNameToWeightMap[name] == 0 {
+            f.pluginNameToWeightMap[name] = 1
+        }
+        // 需要了解的是framework.MaxTotalScore的值是64位整数的最大值，framework.MaxNodeScore的值是100；
+        // 每个插件的标准化分数是[0, 100], 所有插件最大标准化分数乘以权重的累加之和不能超过int64最大值，
+        // 否则在计算分数的时候可能会溢出，所以此处需要校验配置的权重是否会导致计算分数溢出。
+        if int64(f.pluginNameToWeightMap[name])*framework.MaxNodeScore > framework.MaxTotalScore-totalPriority {
+            return nil, fmt.Errorf("total score of Score plugins could overflow")
+        }
+        totalPriority += int64(f.pluginNameToWeightMap[name]) * framework.MaxNodeScore
+    }
+
+    // pluginsMap是所有已经创建好的插件，但是是map结构，现在需要把这些插件按照扩展点分到不同的slice中。
+    // 即map[string]framework.Plugin->[]framework.QueueSortPlugin,[]framework.PreFilterPlugin...的过程。
+    // 关于getExtensionPoints()和updatePluginList()的实现还是挺有意思的，用了反射，感兴趣的同学可以看一看。
+    for _, e := range f.getExtensionPoints(plugins) {
+        if err := updatePluginList(e.slicePtr, e.plugins, pluginsMap); err != nil {
+            return nil, err
+        }
+    }
+
+    // 检验ScorePlugin的权重不能为0，当前已经起不了作用了，因为在创建插件的时候没有配置权重的插件的权重都是1.
+    // 但是这些代码还是有必要的，未来保不齐会修改前面的代码，这些校验可能就起到作用了。关键是在构造函数中，只会执行一次，这点校验计算量可以忽略不计。
+    for _, scorePlugin := range f.scorePlugins {
+        if f.pluginNameToWeightMap[scorePlugin.Name()] == 0 {
+            return nil, fmt.Errorf("score plugin %q is not configured with weight", scorePlugin.Name())
+        }
+    }
+
+    // 不能没有调度队列的排序插件，并且也不能有多个，多了没用。
+    // 那么如果同时存在两种优先级计算方法怎么办？用不同的Framework，即不同的SchedulingProfile.
+    if len(f.queueSortPlugins) == 0 {
+        return nil, fmt.Errorf("no queue sort plugin is enabled")
+    }
+    if len(f.queueSortPlugins) > 1 {
+        return nil, fmt.Errorf("only one queue sort plugin can be enabled")
+    }
+    // 不能没有绑定插件，否则调度的结果没法应用到集群
+    if len(f.bindPlugins) == 0 {
+        return nil, fmt.Errorf("at least one bind plugin is needed")
+    }
+    // 如果调用者需要捕获KubeSchedulerProfile，则将KubeSchedulerProfile回调给调用者
+    if options.captureProfile != nil {
+        if len(outputProfile.PluginConfig) != 0 {
+            // 按照Profile名字排序
+            sort.Slice(outputProfile.PluginConfig, func(i, j int) bool {
+                return outputProfile.PluginConfig[i].Name < outputProfile.PluginConfig[j].Name
+            })
+        } else {
+            outputProfile.PluginConfig = nil
+        }
+        options.captureProfile(outputProfile)
+    }
+
+    return f, nil
+}
+```
+
+不知道读者什么感觉，反正笔者看完frameworkImpl构造函数后感觉打通了任督二脉，Framework一下就全通了。接下来笔者带领大家看一些比较有特色的Framework接口实现。
