@@ -359,3 +359,230 @@ func NewFramework(r Registry, plugins *config.Plugins, args []config.PluginConfi
 ```
 
 不知道读者什么感觉，反正笔者看完frameworkImpl构造函数后感觉打通了任督二脉，Framework一下就全通了。接下来笔者带领大家看一些比较有特色的Framework接口实现。
+
+### RunFilterPlugins
+
+为什么RunFilterPlugins？因为相比于其他RunXxxPlugins多了runAllFilters校验，源码链接：<https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/scheduler/framework/runtime/framework.go#L527>
+
+```go
+func (f *frameworkImpl) RunFilterPlugins(
+    ctx context.Context,
+    state *framework.CycleState,
+    pod *v1.Pod,
+    nodeInfo *framework.NodeInfo,
+) framework.PluginToStatus {
+    // 之前一直没有介绍PluginToStatus，它是一个map类型，用于记录每个插件的执行状态，此处状态和HTTP返回的status类似，是一种结果。
+    statuses := make(framework.PluginToStatus)
+    // 遍历所有的FilterPlugin，因为filterPlugins是slice类型，所以每次都是按照配置的顺序执行
+    for _, pl := range f.filterPlugins {
+        // runFilterPlugin()是执行单个FilterPlugin插件的函数，下面有注释
+        pluginStatus := f.runFilterPlugin(ctx, pl, state, pod, nodeInfo)
+        // 此处需要简单说明一下插件返回的状态包括：
+        // 1. Success: 成功，没什么好解释的
+        // 2. Error: 插件内部错误，比如插件调用Clientset报错
+        // 3. Unschedulable: 不可调度，比如资源不足，但是可以通过抢占的方式解决
+        // 4. UnschedulableAndUnresolvable: 不可调度并且无法解决，意思就是抢占调度也解决不了
+        // 5. Wait: PermitPlugin专属状态，用来延迟Pod的绑定
+        // 6. Skip: BindPlugin专属状态，如果BindPlugin不能绑定Pod则返回这个状态
+        // 过滤成功就继续循环用下一个插件过滤，过滤失败则需要特殊处理一下
+        if !pluginStatus.IsSuccess() {
+            // 如果插件返回的不是不可调度，那只能是内部错误，那么就直接返回错误，因为内部错误后续是无法解决的，抢占也不行
+            if !pluginStatus.IsUnschedulable() {
+                errStatus := framework.NewStatus(framework.Error, fmt.Sprintf("running %q filter plugin for pod %q: %v", pl.Name(), pod.Name, pluginStatus.Message()))
+                return map[string]*framework.Status{pl.Name(): errStatus}
+            }
+            // 当前只有Unschedulable或者UnschedulableAndUnresolvable，二者都是不可调度状态。
+            statuses[pl.Name()] = pluginStatus
+            // 如果配置了runAllFilters = true，剩下的FilterPlugin也需要执行一次，这样的设计时为什么？
+            // 笔者猜测是为了抢占调度准备，因为后续插件可能还会返回不可调度状态，比如当前因为CPU不可调度，后续可能因为PVC不可调度。
+            // 如果提供给抢占调度插件的状态中只有CPU不满足，那么抢占了CPU资源也会因为PVC无法满足而过滤失败。
+            // 更关键的是，如果后续插件返回了UnschedulableAndUnresolvable，那么就没必要调用抢占调度插件了。
+            // 所以只有运行全部插件才能为Pod后续操作提供最准确的参考。
+            if !f.runAllFilters {
+                return statuses
+            }
+        }
+    }
+
+    return statuses
+}
+
+// runFilterPlugin()运行一个FilterPlugin，非常简单，单独封装一个函数就是为了记录metrics。
+func (f *frameworkImpl) runFilterPlugin(ctx context.Context, pl framework.FilterPlugin, state *framework.CycleState, pod *v1.Pod, nodeInfo *framework.NodeInfo) *framework.Status {
+    if !state.ShouldRecordPluginMetrics() {
+        return pl.Filter(ctx, state, pod, nodeInfo)
+    }
+    startTime := time.Now()
+    status := pl.Filter(ctx, state, pod, nodeInfo)
+    f.metricsRecorder.observePluginDurationAsync(Filter, pl.Name(), status, metrics.SinceInSeconds(startTime))
+    return status
+}
+
+```
+
+### RunScorePlugins
+
+为什么是RunScorePlugins？因为可以让我们知道Framework是如何利用ScorePlugin计算Node的分数，源码链接：<https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/scheduler/framework/runtime/framework.go#L635>
+
+```go
+func (f *frameworkImpl) RunScorePlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodes []*v1.Node) (ps framework.PluginToNodeScores, status *framework.Status) {
+    startTime := time.Now()
+    defer func() {
+        metrics.FrameworkExtensionPointDuration.WithLabelValues(score, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
+    }()
+    // 此处需要简单说明一下PluginToNodeScores类型，它是一个map[string][]{Name, Score}(伪代码，Name是Node名字，Score是Node分数)类型。
+    // 说白了就是每个ScorePlugin给每个Node的分数，此处的Node是所有RunFilterPlugins()返回成功的Node集合。
+    pluginToNodeScores := make(framework.PluginToNodeScores, len(f.scorePlugins))
+    // 提前把所有ScorePlugin对所有的Node的评分的内存申请出来，这样后面并行计算分数时就不用加锁了
+    for _, pl := range f.scorePlugins {
+        pluginToNodeScores[pl.Name()] = make(framework.NodeScoreList, len(nodes))
+    }
+    // 为并行计算分数创建context和错误chan，请参看parallelize包了解细节
+    ctx, cancel := context.WithCancel(ctx)
+    errCh := parallelize.NewErrorChannel()
+
+    // parallelize.Until()是一个比较有用的工具，就是并行的执行函数。需要注意len(nodes)不是并行度，它是处理总量。
+    // parallelize的并行度是可设置的，默认值是16，如果处理的总量超过并行度， parallelize.Until()会分片处理，即一个协程处理一小部分。
+    // 所以下面的代码可以假定Node间并行的执行所有ScorePlugin计算分数。
+    parallelize.Until(ctx, len(nodes), func(index int) {
+        // 遍历所有的ScorePlugin
+        for _, pl := range f.scorePlugins {
+            // 计算第index个Node的分数
+            nodeName := nodes[index].Name
+            s, status := f.runScorePlugin(ctx, pl, state, pod, nodeName)
+            // 评分失败退出函数
+            if !status.IsSuccess() {
+                err := fmt.Errorf("plugin %q failed with: %w", pl.Name(), status.AsError())
+                // errCh.SendErrorWithCancel()会调用cancel()，所以其他的并行的协程也会退出。
+                errCh.SendErrorWithCancel(err, cancel)
+                return
+            }
+            // 记录插件给第index个Node的分数，这就是提前为pluginToNodeScores申请内存的好处，不需要再加锁了
+            pluginToNodeScores[pl.Name()][index] = framework.NodeScore{
+                Name:  nodeName,
+                Score: s,
+            }
+        }
+    })
+    // 如果有任何ScorePlugin出错，则返回错误状态
+    if err := errCh.ReceiveError(); err != nil {
+        klog.ErrorS(err, "Failed running Score plugins", "pod", klog.KObj(pod))
+        return nil, framework.AsStatus(fmt.Errorf("running Score plugins: %w", err))
+    }
+
+    // 并行的标准化Node分数，每个ScorePlugin对所有的Node分数标准化处理，ScorePlugin之间是并行的
+    parallelize.Until(ctx, len(f.scorePlugins), func(index int) {
+        // 判断ScorePlugin是否有扩展接口，如果没有就不用标准化分数处理了
+        pl := f.scorePlugins[index]
+        nodeScoreList := pluginToNodeScores[pl.Name()]
+        if pl.ScoreExtensions() == nil {
+            return
+        }
+        // 调用ScorePlugin的扩展接口标准化所有Node的分数
+        status := f.runScoreExtension(ctx, pl, state, pod, nodeScoreList)
+        if !status.IsSuccess() {
+            err := fmt.Errorf("plugin %q failed with: %w", pl.Name(), status.AsError())
+            errCh.SendErrorWithCancel(err, cancel)
+            return
+        }
+    })
+    // 如果有任何ScorePlugin出错，则返回错误状态
+    if err := errCh.ReceiveError(); err != nil {
+        klog.ErrorS(err, "Failed running Normalize on Score plugins", "pod", klog.KObj(pod))
+        return nil, framework.AsStatus(fmt.Errorf("running Normalize on Score plugins: %w", err))
+    }
+
+    // 并行的在Node标准化分数基础上乘以权重
+    parallelize.Until(ctx, len(f.scorePlugins), func(index int) {
+        pl := f.scorePlugins[index]
+        // 获取插件的权重以及所有Node的标准化分数
+        weight := f.pluginNameToWeightMap[pl.Name()]
+        nodeScoreList := pluginToNodeScores[pl.Name()]
+
+        // 遍历Node标准化分数
+        for i, nodeScore := range nodeScoreList {
+            // 如果Node标准化分数超过[0, 100]范围，则返回错误
+            if nodeScore.Score > framework.MaxNodeScore || nodeScore.Score < framework.MinNodeScore {
+                err := fmt.Errorf("plugin %q returns an invalid score %v, it should in the range of [%v, %v] after normalizing", pl.Name(), nodeScore.Score, framework.MinNodeScore, framework.MaxNodeScore)
+                errCh.SendErrorWithCancel(err, cancel)
+                return
+            }
+            // Node分数就是标准化分数乘以插件的权重
+            nodeScoreList[i].Score = nodeScore.Score * int64(weight)
+        }
+    })
+    // 如果有任何ScorePlugin的标准化分数超出范围，则返回错误状态
+    if err := errCh.ReceiveError(); err != nil {
+        klog.ErrorS(err, "Failed applying score defaultWeights on Score plugins", "pod", klog.KObj(pod))
+        return nil, framework.AsStatus(fmt.Errorf("applying score defaultWeights on Score plugins: %w", err))
+    }
+
+    // 返回每个ScorePlugin对所有Node的评分，并且已经乘上了插件对应的权重
+    return pluginToNodeScores, nil
+}
+
+// runScorePlugin()调用一个ScorePlugin计算Node的分数，单独封装一个函数就是为了记录metrics。
+func (f *frameworkImpl) runScorePlugin(ctx context.Context, pl framework.ScorePlugin, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
+    if !state.ShouldRecordPluginMetrics() {
+        return pl.Score(ctx, state, pod, nodeName)
+    }
+    startTime := time.Now()
+    s, status := pl.Score(ctx, state, pod, nodeName)
+    f.metricsRecorder.observePluginDurationAsync(score, pl.Name(), status, metrics.SinceInSeconds(startTime))
+    return s, status
+}
+```
+
+### RunBindPlugins
+
+为什么是RunBindPlugins？因为有的BindPlugin会返回Skip状态，源码链接：<https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/scheduler/framework/runtime/framework.go#L762>
+
+```go
+func (f *frameworkImpl) RunBindPlugins(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (status *framework.Status) {
+    startTime := time.Now()
+    defer func() {
+        metrics.FrameworkExtensionPointDuration.WithLabelValues(bind, status.Code().String(), f.profileName).Observe(metrics.SinceInSeconds(startTime))
+    }()
+    // 没有BindPlugin，等同于所有的BindPlugin都返回了Skip状态。理论上不会出现这种情况，因为在Framework构造函数做了相关校验。
+    if len(f.bindPlugins) == 0 {
+        return framework.NewStatus(framework.Skip, "")
+    }
+    // 遍历BindPlugin
+    for _, bp := range f.bindPlugins {
+        // 执行插件的绑定接口
+        status = f.runBindPlugin(ctx, bp, state, pod, nodeName)
+        // 如果返回Skip状态，则忽略这个插件。也就是说BindPlugin可以根据Pod选择是否执行绑定。
+        // 虽然当前只有DefaultBinder一种实现，笔者猜测：设计者认为有的绑定可能比较复杂，交给特定的插件绑定。
+        if status != nil && status.Code() == framework.Skip {
+            continue
+        }
+        // 如果绑定失败则返回错误状态
+        if !status.IsSuccess() {
+            err := status.AsError()
+            klog.ErrorS(err, "Failed running Bind plugin", "plugin", bp.Name(), "pod", klog.KObj(pod))
+            return framework.AsStatus(fmt.Errorf("running Bind plugin %q: %w", bp.Name(), err))
+        }
+        return status
+    }
+    return status
+}
+
+// runBindPlugin()执行一个插件的绑定操作，单独封装一个函数就是为了记录metrics。
+func (f *frameworkImpl) runBindPlugin(ctx context.Context, bp framework.BindPlugin, state *framework.CycleState, pod *v1.Pod, nodeName string) *framework.Status {
+    if !state.ShouldRecordPluginMetrics() {
+        return bp.Bind(ctx, state, pod, nodeName)
+    }
+    startTime := time.Now()
+    status := bp.Bind(ctx, state, pod, nodeName)
+    f.metricsRecorder.observePluginDurationAsync(bind, bp.Name(), status, metrics.SinceInSeconds(startTime))
+    return status
+}
+```
+
+# 总结
+
+1. Profile和Framework是一一对应的，kube-scheduler会为一个Profile创建一个Framework，可以通过设置Pod.Spec.SchedulerName选择Framework执行调度；
+2. Framework将调度一个Pod分为调度周期和绑定周期，每个Pod的调度周期是串行的，但是绑定周期可能是并行的；
+3. Framework定义了扩展点的概念，并且为每个扩展定定义了接口，即XxxPlugin；
+4. Framework为每个扩展点定义了一个入口，RunXxxPlugins，Framework会按照Profile配置的插件顺序依次调用插件；
+5. Framework插件定义了句柄和抢占句柄，为插件实现特定的功能提供接口；
