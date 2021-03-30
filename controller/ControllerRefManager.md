@@ -127,3 +127,126 @@ func (m *BaseControllerRefManager) ClaimObject(obj metav1.Object, match func(met
 }
 
 ```
+
+# PodControllerRefManager
+
+PodControllerRefManager用于管理Pod的ControllerRef，也就是说PodControllerRefManager.ClaimObject()函数传入的对象都是Pod，源码链接: <https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/controller/controller_ref_manager.go#L123>。
+
+```go
+type PodControllerRefManager struct {
+    // 继承了BaseControllerRefManager，因为BaseControllerRefManager用于管理通用对象的ControllerRef
+    BaseControllerRefManager
+    // ControllerRef的Group、Version、Kind三元组，比如apps、v1、ReplicaSet
+    controllerKind schema.GroupVersionKind
+    // PodControlInterface用于创建/删除/更新Pod，详情查看：https://github.com/jindezgm/k8s-src-analysis/blob/master/controller/PodControl.md
+    podControl     PodControlInterface
+}
+
+// NewPodControllerRefManager()是PodControllerRefManager的构造函数，由kube-controller-manager调用。
+func NewPodControllerRefManager(
+    podControl PodControlInterface,
+    controller metav1.Object,
+    selector labels.Selector,
+    controllerKind schema.GroupVersionKind,
+    canAdopt func() error,
+) *PodControllerRefManager {
+    // PodControllerRefManager所有参数基本都是外部传入的...
+    return &PodControllerRefManager{
+        BaseControllerRefManager: BaseControllerRefManager{
+            Controller:   controller,
+            Selector:     selector,
+            CanAdoptFunc: canAdopt,
+        },
+        controllerKind: controllerKind,
+        podControl:     podControl,
+    }
+}
+
+// ClaimPods()尝试获取一组Pod的拥有权，同时传入了一组过滤函数(想必是给BaseControllerRefManager.ClaimObject()的匹配函数使用的)。
+func (m *PodControllerRefManager) ClaimPods(pods []*v1.Pod, filters ...func(*v1.Pod) bool) ([]*v1.Pod, error) {
+    var claimed []*v1.Pod
+    var errlist []error
+
+    // 终于看到匹配函数了，Pod的匹配函数是标签匹配同时通过所有过滤器，标签选择器好理解，过滤器到底过滤了啥就得看XxxController的具体实现了。
+    match := func(obj metav1.Object) bool {
+        pod := obj.(*v1.Pod)
+        if !m.Selector.Matches(labels.Set(pod.Labels)) {
+            return false
+        }
+        for _, filter := range filters {
+            if !filter(pod) {
+                return false
+            }
+        }
+        return true
+    }
+    // 接纳Pod和释放Pod拥有权的函数，下面有这两个函数的注释
+    adopt := func(obj metav1.Object) error {
+        return m.AdoptPod(obj.(*v1.Pod))
+    }
+    release := func(obj metav1.Object) error {
+        return m.ReleasePod(obj.(*v1.Pod))
+    }
+
+    // 遍历Pod，逐个获得/释放Pod拥有权
+    for _, pod := range pods {
+        // 尝试获取Pod的拥有权
+        ok, err := m.ClaimObject(pod, match, adopt, release)
+        if err != nil {
+            errlist = append(errlist, err)
+            continue
+        }
+        if ok {
+            claimed = append(claimed, pod)
+        }
+    }
+    // 返回获得拥有权的Pod以及没有获得拥有权的错误
+    return claimed, utilerrors.NewAggregate(errlist)
+}
+
+// AdoptPod()发送Patch更新请求到apieserver来获得Pod的拥有权，将ControllerRef合并到Pod.OwnerReferences.
+func (m *PodControllerRefManager) AdoptPod(pod *v1.Pod) error {
+    // 还记得CanAdopt()是一个只会真正调用一次的函数么？此处需要知道PodControllerRefManager.ClaimPods()传入的是多个Pod。
+    // 也就是说这些Pod如果有多个Pod需要校验CanAdopt()，则第一个Pod决定了后面所有的Pod，即要么都能接纳，要么都不能接纳。
+    // 这更加证明了能否接纳子对象看Controller的状态而不是子对象的状态。
+    if err := m.CanAdopt(); err != nil {
+        return fmt.Errorf("can't adopt Pod %v/%v (%v): %v", pod.Namespace, pod.Name, pod.UID, err)
+    }
+    
+    // ownerRefControllerPatch()会生成ControllerRef的补丁，读者可以自己看一下，非常简单
+    patchBytes, err := ownerRefControllerPatch(m.Controller, m.controllerKind, pod.UID)
+    if err != nil {
+        return err
+    }
+    // Patch更新Pod。
+    return m.podControl.PatchPod(pod.Namespace, pod.Name, patchBytes)
+}
+
+// ReleasePod()发送Patch更新请求到apiserver来释放Pod拥有权，从Pod.OwnerReferences中通过UID删除ControllerRef。
+func (m *PodControllerRefManager) ReleasePod(pod *v1.Pod) error {
+    klog.V(2).Infof("patching pod %s_%s to remove its controllerRef to %s/%s:%s",
+        pod.Namespace, pod.Name, m.controllerKind.GroupVersion(), m.controllerKind.Kind, m.Controller.GetName())
+    // deleteOwnerRefStrategicMergePatch()会生成一个删除指定UID的OwnerReference的补丁。
+    // 关于Patch更新的实现笔者会有单独的文章介绍，此处只需要知道Patch更新能够删除指定Pod(UID)的指定OwnerReferences(UID)即可。
+    patchBytes, err := deleteOwnerRefStrategicMergePatch(pod.UID, m.Controller.GetUID())
+    if err != nil {
+        return err
+    }
+    // Patch更新Pod
+    err = m.podControl.PatchPod(pod.Namespace, pod.Name, patchBytes)
+    if err != nil {
+        if errors.IsNotFound(err) {
+            // 如果Pod不存在，跟已经释放Pod拥有权是一样的
+            return nil
+        }
+        if errors.IsInvalid(err) {
+            // 返回Invalid错误有两种可能：
+            // 1. Pod没有OwnerReferences，即为nil；
+            // 2. 补丁包中PodUID不存在，即Pod被删除后又创建
+            // 这两种可能造成的错误都可以忽略，因为Controller就没有Pod的拥有权，所以返回成功
+            return nil
+        }
+    }
+    return err
+}
+```
