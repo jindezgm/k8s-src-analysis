@@ -255,7 +255,7 @@ func (m *PodControllerRefManager) ReleasePod(pod *v1.Pod) error {
 
 了解PodControllerRefManager，那么ReplicaSetControllerRefManager就非常容易了，它是用来管理ReplicaSet的ControllerRef的。那么问题来了，谁的的子对象会是ReplicaSet？答案是Deployment，所以此处得到一个结论：Deployment对Pod的控制是通过ReplicaSet实现的，那么Deployment控制什么？这个可以参看[DeploymentController](./DeploymentController.md)。
 
-因为有了PodControllerRefManager的铺垫，笔者不会对ReplicaSetControllerRefManager做比较详细的注释，源码链接: <https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/controller/controller_ref_manager.go#L261>。
+因为有了PodControllerRefManager的铺垫，笔者不会对ReplicaSetControllerRefManager做比较详细的注释，源码链接: <https://github.com/kubernetes/kubernetes/blob/release-1.21/pkg/controller/controller_ref_manager.go#L261>。
 
 ```go
 // ReplicaSetControllerRefManager基本上与PodControllerRefManager相同，只是资源类型的不同。
