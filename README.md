@@ -8,3 +8,4 @@
 
 1. [kube-scheduler](./kube-scheduler/README.md)
 2. [client-go](./client-go/README.md)
+3. [controller](./controller/README.md)

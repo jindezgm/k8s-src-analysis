@@ -250,3 +250,104 @@ func (m *PodControllerRefManager) ReleasePod(pod *v1.Pod) error {
     return err
 }
 ```
+
+## ReplicaSetControllerRefManager
+
+了解PodControllerRefManager，那么ReplicaSetControllerRefManager就非常容易了，它是用来管理ReplicaSet的ControllerRef的。那么问题来了，谁的的子对象会是ReplicaSet？答案是Deployment，所以此处得到一个结论：Deployment对Pod的控制是通过ReplicaSet实现的，那么Deployment控制什么？这个可以参看[DeploymentController](./DeploymentController.md)。
+
+因为有了PodControllerRefManager的铺垫，笔者不会对ReplicaSetControllerRefManager做比较详细的注释，源码链接: <https://github.com/kubernetes/kubernetes/blob/release-1.20/pkg/controller/controller_ref_manager.go#L261>。
+
+```go
+// ReplicaSetControllerRefManager基本上与PodControllerRefManager相同，只是资源类型的不同。
+type ReplicaSetControllerRefManager struct {
+    BaseControllerRefManager
+    controllerKind schema.GroupVersionKind
+    rsControl      RSControlInterface
+}
+
+// ReplicaSetControllerRefManager的构造函数，与PodControllerRefManager基本相同，不多解释
+func NewReplicaSetControllerRefManager(
+    rsControl RSControlInterface,
+    controller metav1.Object,
+    selector labels.Selector,
+    controllerKind schema.GroupVersionKind,
+    canAdopt func() error,
+) *ReplicaSetControllerRefManager {
+    return &ReplicaSetControllerRefManager{
+        BaseControllerRefManager: BaseControllerRefManager{
+            Controller:   controller,
+            Selector:     selector,
+            CanAdoptFunc: canAdopt,
+        },
+        controllerKind: controllerKind,
+        rsControl:      rsControl,
+    }
+}
+
+// ClaimReplicaSets()尝试获取一组ReplicaSet的拥有权，比ClaimPods()少了过滤函数。
+func (m *ReplicaSetControllerRefManager) ClaimReplicaSets(sets []*apps.ReplicaSet) ([]*apps.ReplicaSet, error) {
+    var claimed []*apps.ReplicaSet
+    var errlist []error
+
+    // 匹配函数就是用标签选择器实现的，笔者认为标签选择器实现的匹配函数应该实现在BaseControllerRefManager中，子类直接继承使用。
+    match := func(obj metav1.Object) bool {
+        return m.Selector.Matches(labels.Set(obj.GetLabels()))
+    }
+    // 接纳/释放ReplicaSet拥有权的函数。
+    adopt := func(obj metav1.Object) error {
+        return m.AdoptReplicaSet(obj.(*apps.ReplicaSet))
+    }
+    release := func(obj metav1.Object) error {
+        return m.ReleaseReplicaSet(obj.(*apps.ReplicaSet))
+    }
+
+    // 一个接一个的获取ReplicaSet的拥有权
+    for _, rs := range sets {
+        ok, err := m.ClaimObject(rs, match, adopt, release)
+        if err != nil {
+            errlist = append(errlist, err)
+            continue
+        }
+        if ok {
+            claimed = append(claimed, rs)
+        }
+    }
+    // 返回已经获取拥有权的ReplicaSet和获取拥有权失败的错误
+    return claimed, utilerrors.NewAggregate(errlist)
+}
+
+// AdoptReplicaSet()和ReleaseReplicaSet()与前面的AdoptPod()和ReleasePod()基本一样，笔者不在重复注释了
+func (m *ReplicaSetControllerRefManager) AdoptReplicaSet(rs *apps.ReplicaSet) error {
+    if err := m.CanAdopt(); err != nil {
+        return fmt.Errorf("can't adopt ReplicaSet %v/%v (%v): %v", rs.Namespace, rs.Name, rs.UID, err)
+    }
+    patchBytes, err := ownerRefControllerPatch(m.Controller, m.controllerKind, rs.UID)
+    if err != nil {
+        return err
+    }
+    return m.rsControl.PatchReplicaSet(rs.Namespace, rs.Name, patchBytes)
+}
+
+func (m *ReplicaSetControllerRefManager) ReleaseReplicaSet(replicaSet *apps.ReplicaSet) error {
+    klog.V(2).Infof("patching ReplicaSet %s_%s to remove its controllerRef to %s/%s:%s",
+        replicaSet.Namespace, replicaSet.Name, m.controllerKind.GroupVersion(), m.controllerKind.Kind, m.Controller.GetName())
+    patchBytes, err := deleteOwnerRefStrategicMergePatch(replicaSet.UID, m.Controller.GetUID())
+    if err != nil {
+        return err
+    }
+    err = m.rsControl.PatchReplicaSet(replicaSet.Namespace, replicaSet.Name, patchBytes)
+    if err != nil {
+        if errors.IsNotFound(err) {
+            return nil
+        }
+        if errors.IsInvalid(err) {
+            return nil
+        }
+    }
+    return err
+}
+```
+
+## ControllerRevisionControllerRefManager
+
+ControllerRevisionControllerRefManager笔者留给读者自己阅读，因为ReplicaSetControllerRefManager已经有大量的重复内容了。
