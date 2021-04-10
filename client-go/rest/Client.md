@@ -81,4 +81,122 @@ type RESTClient struct {
     // 前文提到RestClient继承了http.Client就是通过成员变量实现的。
     Client *http.Client
 }
+
+// ClientContentConfig是客户端关于HTTP内容(http.Request.Body和http.Response.Body)的配置。
+type ClientContentConfig struct {
+    // 指定客户端将接受的内容类型，如果没有设置，将使用ContentType设置Accept请求头。就是RestClient希望apiserver响应内容的类型。
+    // 关于Accept请求头参看：https://developer.mozilla.org/zh-CN/docs/Web/HTTP/Headers/Accept
+    AcceptContentTypes string
+    // 指定用于与服务端通信的格式，如果未设置AcceptContentTypes，则将用于设置Accept请求头，并设置为给服务端的任何对象的默认内容类型。
+    // 如果没有设置，则使用"application/json"。就是告诉服务端(apiserver)http.Request.Body的格式。
+    ContentType string
+    // API组和版本，直接初始化RestClient时必须提供。
+    GroupVersion schema.GroupVersion
+    // Negotiator用于获取支持的多种媒体类型的编码器和解码器，关于Negotiator读者可以暂时不用深入理解，只需要知道他可以根据媒体类型获取编解码器就可以了。
+    // 至于什么是编解码器，说白了就是用来序列化和反序列化API对象的，可以直接理解为json.Marshal()和json.Unmarsal()。
+    // 因为AcceptContentTypes和ContentType两个配置，所以需要根据相应的类型获取编解码器。
+    Negotiator runtime.ClientNegotiator
+}
 ```
+
+看为了RestClient的定义，接下来看看RestClient的构造函数，源码链接：<https://github.com/kubernetes/client-go/blob/release-1.21/rest/client.go#L107>
+
+```go
+// NewRESTClient()是RestClient的构造函数，从构造函数的参数上看，RestClient大部分成员变量都是外部传入的。
+func NewRESTClient(baseURL *url.URL, versionedAPIPath string, config ClientContentConfig, rateLimiter flowcontrol.RateLimiter, client *http.Client) (*RESTClient, error) {
+    // ContentType如果没有设置，默认使用"application/json"，默认的编码器和解码器也可以看做是json.Marshal()和json.Unmarshal()。
+    if len(config.ContentType) == 0 {
+        config.ContentType = "application/json"
+    }
+
+    // 初始化baseURL，这个比较好理解。
+    base := *baseURL
+    if !strings.HasSuffix(base.Path, "/") {
+        base.Path += "/"
+    }
+    base.RawQuery = ""
+    base.Fragment = ""
+
+    // 返回RestClient对象
+    return &RESTClient{
+        base:             &base,
+        versionedAPIPath: versionedAPIPath,
+        content:          config,
+        // readExpBackoffConfig是构造退避管理器的函数，下面有注释
+        createBackoffMgr: readExpBackoffConfig,
+        rateLimiter:      rateLimiter,
+
+        Client: client,
+    }, nil
+}
+
+// readExpBackoffConfig()是RestClient构造退避管理器的函数
+func readExpBackoffConfig() BackoffManager {
+    // 通过环境变量获取退避的初始时间和最大时间，单位为秒。
+    backoffBase := os.Getenv(envBackoffBase)
+    backoffDuration := os.Getenv(envBackoffDuration)
+
+    // 因为环境变量是字符串型，所以此处需要转为整型
+    backoffBaseInt, errBase := strconv.ParseInt(backoffBase, 10, 64)
+    backoffDurationInt, errDuration := strconv.ParseInt(backoffDuration, 10, 64)
+    // 如果没有配置环境变量或者错误配置，则无需退避
+    if errBase != nil || errDuration != nil {
+        return &NoBackoff{}
+    }
+    // URLBackoff是以URL为键计算退避时间，也就是说某个URL访问错误，如果立刻访问相同的URL就需要退避一段时间，退避时间随着错误次数增加以2的指数增加。
+    // 此处需要注意的是，URL是baseURL，这个应该好理解，某个主机访问出错，立刻访问这个主机大概率还是可能会出错，即便访问的是不同的API。
+    return &URLBackoff{
+        Backoff: flowcontrol.NewBackOff(
+            time.Duration(backoffBaseInt)*time.Second,
+            time.Duration(backoffDurationInt)*time.Second)}
+}
+```
+
+看完了RestClient的定义，接下来看看RestClient的构造函数，源码链接：<https://github.com/kubernetes/client-go/blob/release-1.21/rest/client.go#L169>
+
+```go
+// Verb()创建了Request对象，然后设置Request的verb属性。
+func (c *RESTClient) Verb(verb string) *Request {
+    return NewRequest(c).Verb(verb)
+}
+
+// Post()利用Verb()实现，这个非常简单。
+func (c *RESTClient) Post() *Request {
+    return c.Verb("POST")
+}
+
+// Put()利用Verb()实现，这个非常简单。
+func (c *RESTClient) Put() *Request {
+    return c.Verb("PUT")
+}
+
+// Patch()利用Verb()创建了Request，然后将Patch类型设置Content-Type请求头，读者可以看下types.PatchType的枚举定义就更容易理解了。
+func (c *RESTClient) Patch(pt types.PatchType) *Request {
+    return c.Verb("PATCH").SetHeader("Content-Type", string(pt))
+}
+
+// Get()利用Verb()实现，这个非常简单。
+func (c *RESTClient) Get() *Request {
+    return c.Verb("GET")
+}
+
+// Delete()利用Verb()实现，这个非常简单。
+func (c *RESTClient) Delete() *Request {
+    return c.Verb("DELETE")
+}
+
+// 获取API组和版本。
+func (c *RESTClient) APIVersion() schema.GroupVersion {
+    return c.content.GroupVersion
+}
+```
+
+感觉RestClient实现Interface接口非常简单，其实这里面最核心的函数是NewRequest()，利用RestClient构造Request对象，笔者会在[解析Request的文章](./Request.md)详细说明。
+
+# 总结
+
+1. RestClient是操作某个组/版本(比如apps/v1)的API对象的REST客户端；
+2. RestClient的主要功能就是创建Request，甚至可以理解为RequestFactory；
+3. RestClient的限流器是所有Request共享使用的，也就是说RestClient创建的Request虽然可以并发提交，但是都会被限流器统一限制在某个QPS以内；
+4. RestClient的构造函数传入了限流器，不是自己构造的，可以推测多个RestClient(比如apps/v1、core/v1)之间共享同一个限流器；
+5. 退避管理器是以URL(base)为键管理退避时间，同一个Request向不同的host提交产生的错误不会累加，单独计算退避时间；
