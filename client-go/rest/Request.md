@@ -63,3 +63,63 @@ type Request struct {
     body io.Reader
 }
 ```
+
+## NewRequest
+
+在[RESTClient解析](./Client.md)中实现Interface章节，笔者提到了核心就是Request的构造函数，现在就来看看Request构造函数的实现，源码链接：<https://github.com/kubernetes/client-go/blob/release-1.21/rest/request.go#L118>
+
+```go
+// NewRequest()是Request的构造函数，需要传入RESTClient对象。
+func NewRequest(c *RESTClient) *Request {
+    // 创建Request的退避管理器，关于退避管理器的功能已经在RESTClient中解释很多了，此处不再赘述了。
+    // 只需要知道一点，每个Request都有一个独立的退避管理器。
+    var backoff BackoffManager
+    if c.createBackoffMgr != nil {
+        backoff = c.createBackoffMgr()
+    }
+    // 如果RESTClient没有设置创建退避管理器的函数，则不使用退避策略。
+    if backoff == nil {
+        backoff = noBackoff
+    }
+
+    // 设置Request的URL路径前缀，就是RESTClient.base.Path/RESTClient.versionedAPIPath
+    // 需要注意的是，一般RESTClient.base.Path是空的，而https://192.168.1.2:6443分散在RESTClient.base.Scheme和RESTClient.base.Host中。
+    // 所以此处的pathPrefix与c.versionedAPIPath基本是相同的，例如/apis/apps/v1
+    var pathPrefix string
+    if c.base != nil {
+        pathPrefix = path.Join("/", c.base.Path, c.versionedAPIPath)
+    } else {
+        pathPrefix = path.Join("/", c.versionedAPIPath)
+    }
+
+    // 复用http.Client的超时作为请求的超时
+    var timeout time.Duration
+    if c.Client != nil {
+        timeout = c.Client.Timeout
+    }
+
+    // 创建Request对象
+    r := &Request{
+        c:              c,
+        rateLimiter:    c.rateLimiter,
+        backoff:        backoff,
+        timeout:        timeout,
+        pathPrefix:     pathPrefix,
+        // 默认最多尝试次数是10次
+        maxRetries:     10,
+        warningHandler: c.warningHandler,
+    }
+
+    // 设置Accept请求头，优先使用AcceptContentTypes，如果没有设置则使用ContentType
+    // 此处如果对AcceptContentTypes和ContentType不了解，请参看笔者解析RESTClient的文章。
+    switch {
+    case len(c.content.AcceptContentTypes) > 0:
+        r.SetHeader("Accept", c.content.AcceptContentTypes)
+    case len(c.content.ContentType) > 0:
+        r.SetHeader("Accept", c.content.ContentType+", */*")
+    }
+    return r
+}
+```
+
+现在应该理解为什么通过RESTClient创建Request了，因为RESTClient包含了大量Request之间共享的信息，比如限流器、退避管理器构造函数、路径前缀，更关键的是Request.c指向了RESTClient，这样Request就具备了向服务端提交请求的能力。
