@@ -201,3 +201,51 @@ func (r *Request) Body(obj interface{}) *Request {
     return r
 }
 ```
+
+有没有发现Request没有一个成员变量记录最终的URL？这是因为很多成员变量没有设置是无法知道最终的URL的。而构造http.Request需要传入最终的URL，这就是需要Request提供获取最终URL的接口，源码链接：<https://github.com/kubernetes/client-go/blob/release-1.21/rest/request.go#L468>
+
+```go
+// URL()函数将生成Request的最终URL，例如https://192.168.1.2:6443/apis/apps/v1/namespaces/ns/deployments/name/subresource/subpath?params
+func (r *Request) URL() *url.URL {
+    // URL路径以前缀作为起始，例如/apis/apps/v1
+    p := r.pathPrefix
+    // 如果Request设置了命名空间，则在路径上追加命名空间，需要注意的是增加了一个"namespaces"，例如/apis/apps/v1/namespaces/ns
+    if r.namespaceSet && len(r.namespace) > 0 {
+        p = path.Join(p, "namespaces", r.namespace)
+    }
+    // 如果Request设置了资源种类(deployments)，则追加资种类，此处需要注意的是将资源种类转换为小写。
+    // 例如/apis/apps/v1/namespaces/ns/deployments/，此处需要注意资源(Resource)和种类(Kind)是不同的，
+    // 所以是deployments而不是deployment，这部分会在Kubernetes API约定中有介绍。
+    if len(r.resource) != 0 {
+        p = path.Join(p, strings.ToLower(r.resource))
+    }
+    // 如果Request设置了资源名或者子路径或者子资源，则追加到路径中，例如/apis/apps/v1/namespaces/ns/deployments/name/subresources/subpath.
+    // 此处的资源名就是Deployment.Name
+    if len(r.resourceName) != 0 || len(r.subpath) != 0 || len(r.subresource) != 0 {
+        p = path.Join(p, r.resourceName, r.subresource, r.subpath)
+    }
+
+    // 准备返回最终URL
+    finalURL := &url.URL{}
+    if r.c.base != nil {
+        *finalURL = *r.c.base
+    }
+    finalURL.Path = p
+
+    // 将Request的请求参数转换为url.Values类型，因为url.Values类型具有URL编码能力
+    query := url.Values{}
+    for key, values := range r.params {
+        for _, value := range values {
+            query.Add(key, value)
+        }
+    }
+
+    // 特殊处理一下超时，超时是作为请求参数的一部分
+    if r.timeout != 0 {
+        query.Set("timeout", r.timeout.String())
+    }
+    // 编码参数并赋值给最终URL
+    finalURL.RawQuery = query.Encode()
+    return finalURL
+}
+```
