@@ -123,3 +123,81 @@ func NewRequest(c *RESTClient) *Request {
 ```
 
 现在应该理解为什么通过RESTClient创建Request了，因为RESTClient包含了大量Request之间共享的信息，比如限流器、退避管理器构造函数、路径前缀，更关键的是Request.c指向了RESTClient，这样Request就具备了向服务端提交请求的能力。
+
+## Setter/Getter
+
+在Request的构造函数中有很多成员变量没有初始化，比如verb、namespace、resource等，这些都是与具体的请求相关的了。Request提供了大量的Setter/Getter接口用来设置和获取这些成员变量，因为大部分接口过于简单，笔者不一一介绍，只挑选一些重点的接口函数进行解析。
+
+首先来看看Request是如何设置body的，例如向apiserver提交创建Deployment的请求，就需要将Deployment对象放入到Request的body中。而Request.body是io.Reader类型，这里面就有编码的过程，源码链接：<https://github.com/kubernetes/client-go/blob/release-1.21/rest/request.go#L425>
+
+```go
+// Body()用于设置Request.body成员变量，有没有发现该接口的返回值是自己，这种设计可以优雅的实现连续Setter接口的调用，例如：
+// request := RESTClient.Get().Namespace(ns).Resource("pods").SubResource("proxy").Name(net.JoinSchemeNamePort(scheme, name, port)).Suffix(path)
+// 而不是这样
+// request := RESTClient.Get()
+// request.Namespace(ns)
+// request.Resource("pods")
+// ...
+// 但是这种实现也有一个缺点，那就是无法返回错误，出错调用者感知不到，只能将错误记录在Request中，这就是Request.err存在的原因。
+// 还要Body()传入的参数是interface{}，不是runtime.Object，这让Request的使用范围非常广。
+func (r *Request) Body(obj interface{}) *Request {
+    // 在这之前调用某个接口(多半是Setter)的时候已经出错了，所以就没必要再继续执行，直接返回即可。
+    if r.err != nil {
+        return r
+    }
+    // 现在我们来看看interface{}到底比runtime.Object好在哪里！
+    switch t := obj.(type) {
+    // 字符串类型，必须是文件的路径，这一点需要注意，也就是说可以将某个文件的内容写入Request.body()。
+    // 这种用法是不是很熟悉？是不是感觉kubectl create -f ...可以用这种方法实现？
+    case string:
+        data, err := ioutil.ReadFile(t)
+        if err != nil {
+            r.err = err
+            return r
+        }
+        glogBody("Request Body", data)
+        r.body = bytes.NewReader(data)
+    // []byte类型，直接转为io.Reader还是比较容易的，适用于已经将对象序列化成[]byte的情况
+    case []byte:
+        glogBody("Request Body", t)
+        r.body = bytes.NewReader(t)
+    // io.Reader本尊，直接使用即可，适用于已经将对象转换为io.Reader的情况
+    case io.Reader:
+        r.body = t
+    // 终于到Kubernetes的API对象了。
+    case runtime.Object:
+        // 需要校验obj是否为空，这个有点意思了，为什么不用if nil == obj呢？这就考验读者的语言基本功了。
+        // 1. 如果obj为nil是不会进入这个分支的，说明obj != nil
+        // 2. interface{}其实就是一个指针二元组(typeptr, objectptr)，分别指向对象的类型和对象本身，所以obj不为空是正常的
+        // 3. switch type语法无非是把interface{}类型转换为runtime.Object类型，t依然还是一个(typeptr, objectptr)的二元组，所以t也不是nil
+        // 所以此处只能通过反射的方法获取对象指针来判断指向的对象是不是空地址，那么问题来了，为什么我们平时编程的时候不这么判断？
+        // 那是因为我们平时编程很难造出这种类型的对象，大部分代码中都明确了对象的类型和指针，除非你这样写：
+        // obj := (*appsv1.Deployment)(unsafe.Pointer(nil))，此时的obj就是一个*appsv1.Deployment类型但是实际指向了一个nil对象。
+        // 有没有看到unsafe关键字，就是告诉使用者这是不安全的，如果没有足够的把握建议不要使用，但是在Kubernetes里面还是有人这么用的。
+        if reflect.ValueOf(t).IsNil() {
+            return r
+        }
+        // 根据配置的内容类型获得编码器，如果不理解可以把encoder想象为json.Marshal()函数。
+        encoder, err := r.c.content.Negotiator.Encoder(r.c.content.ContentType, nil)
+        if err != nil {
+            r.err = err
+            return r
+        }
+        // 编码对象，其实就是序列化对象，此处可以直接看做json.Marshal(obj)，这样好理解一点
+        data, err := runtime.Encode(encoder, t)
+        if err != nil {
+            r.err = err
+            return r
+        }
+        // 将编码后的对象设置为body
+        glogBody("Request Body", data)
+        r.body = bytes.NewReader(data)
+        // 设置Content-Type请求头，告知apiserver编码类型
+        r.SetHeader("Content-Type", r.c.content.ContentType)
+    // 其他类型的obj不知道怎么处理，所以报错
+    default: 
+        r.err = fmt.Errorf("unknown type used for body: %+v", obj)
+    }
+    return r
+}
+```
