@@ -2,7 +2,7 @@
 
 ![新建集群](./cluster.jpg)
 
-上图为kubespray安装一个kubernetes集群的流程图，其中主轴上每个节点代表一个阶段，而且节点内容为需要执行该阶段内容的及节点范围，其中：
+上图为kubespray:v2.18.0安装一个kubernetes集群的流程图（网络插件为clico），其中主轴上每个节点代表一个阶段，而且节点内容为需要执行该阶段内容的及节点范围，其中：
 
 - local为本机，即执行ansible-playbook命令的节点
 - bastion为堡垒机
@@ -30,4 +30,4 @@
 9. [安装控制平面](./kubernetes/control-plane/README.md)
 10. 在kubernetes节点[安装网络插件](./network_plugin/README.md)
 11. [安装calico rr](./network_plugin/calico/rr/README.md)
-12. 安装apps
+12. 安装apps，比如ingress、rbd_provisioner、helm等。
